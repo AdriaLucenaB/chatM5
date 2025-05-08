@@ -1,81 +1,107 @@
-import socket
-import threading
-from common import send_json, recv_json
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
+from typing import Dict, List, Set
 
-HOST = 'localhost'
-PORT = 12345
+app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
 
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.bind((HOST, PORT))
-server.listen()
+class ConnectionManager:
+    def __init__(self):
+        self.connections: Dict[str, List[WebSocket]] = {}  # sala → sockets
+        self.message_id: Dict[str, int] = {}               # sala → id msg
+        self.messages: Dict[str, Dict[int, Dict]] = {}     # sala → {id: msg}
+        self.admins: Dict[str, Set[str]] = {}              # sala → admins
+        self.creators: Dict[str, str] = {}                 # sala → creador
 
-clients = {}  # socket: {"name": str, "rooms": set()}
-rooms = {}    # room_name: {"members": set(socket), "admins": set(socket), "history": list[dict]}
+    async def connect(self, room: str, username: str, websocket: WebSocket):
+        await websocket.accept()
+        if room not in self.connections:
+            self.connections[room] = []
+            self.message_id[room] = 1
+            self.messages[room] = {}
+            self.admins[room] = {username}
+            self.creators[room] = username
+        self.connections[room].append(websocket)
+        await self.send_history(room, websocket)
 
-lock = threading.Lock()
+    def disconnect(self, room: str, websocket: WebSocket):
+        if room in self.connections and websocket in self.connections[room]:
+            self.connections[room].remove(websocket)
 
-def broadcast(room, message):
-    for client in rooms[room]["members"]:
-        send_json(client, message)
+    async def send_history(self, room: str, websocket: WebSocket):
+        for mid in sorted(self.messages[room]):
+            msg = self.messages[room][mid]
+            await websocket.send_json({
+                "type": "msg",
+                "id": mid,
+                "from": msg["from"],
+                "msg": msg["msg"]
+            })
 
-def handle_client(client_socket):
+    async def broadcast(self, room: str, message: dict):
+        for conn in self.connections.get(room, []):
+            await conn.send_json(message)
+
+    def is_admin(self, room: str, username: str) -> bool:
+        return username in self.admins.get(room, set())
+
+    def add_admin(self, room: str, username: str):
+        self.admins[room].add(username)
+
+    def delete_message(self, room: str, msg_id: int):
+        if msg_id in self.messages[room]:
+            del self.messages[room][msg_id]
+
+manager = ConnectionManager()
+
+@app.get("/", response_class=HTMLResponse)
+async def get(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+@app.websocket("/ws/{room}/{username}")
+async def websocket_endpoint(websocket: WebSocket, room: str, username: str):
+    await manager.connect(room, username, websocket)
     try:
-        user = recv_json(client_socket)
-        with lock:
-            clients[client_socket] = {"name": user["name"], "rooms": set()}
-        send_json(client_socket, {"type": "info", "msg": f"Benvingut/da {user['name']}!"})
-
+        await manager.broadcast(room, {"type": "info", "msg": f"{username} s'ha unit."})
         while True:
-            data = recv_json(client_socket)
-            if data["type"] == "join":
-                room = data["room"]
-                with lock:
-                    if room not in rooms:
-                        rooms[room] = {"members": set(), "admins": set(), "history": []}
-                        rooms[room]["admins"].add(client_socket)
-                    rooms[room]["members"].add(client_socket)
-                    clients[client_socket]["rooms"].add(room)
+            data = await websocket.receive_json()
 
-                    for msg in rooms[room]["history"]:
-                        send_json(client_socket, msg)
+            if data["type"] == "msg":
+                mid = manager.message_id[room]
+                manager.messages[room][mid] = {"from": username, "msg": data["msg"]}
+                await manager.broadcast(room, {
+                    "type": "msg", "id": mid, "from": username, "msg": data["msg"]
+                })
+                manager.message_id[room] += 1
 
-                broadcast(room, {"type": "msg", "room": room, "from": "Sistema", "msg": f"{clients[client_socket]['name']} s'ha unit."})
+            elif data["type"] == "react":
+                await manager.broadcast(room, {
+                    "type": "reaction",
+                    "id": data["id"],
+                    "emoji": data["emoji"],
+                    "from": username
+                })
 
-            elif data["type"] == "msg":
-                room = data["room"]
-                msg_obj = {"type": "msg", "room": room, "from": clients[client_socket]["name"], "msg": data["msg"]}
-                with lock:
-                    rooms[room]["history"].append(msg_obj)
-                broadcast(room, msg_obj)
-
-            elif data["type"] == "delete" and data["room"] in clients[client_socket]["rooms"]:
-                room = data["room"]
-                if client_socket in rooms[room]["admins"]:
-                    with lock:
-                        rooms[room]["history"] = [m for m in rooms[room]["history"] if m["msg"] != data["msg"]]
-                    broadcast(room, {"type": "info", "msg": f"L'admin ha esborrat un missatge."})
+            elif data["type"] == "delete":
+                if manager.is_admin(room, username):
+                    manager.delete_message(room, data["id"])
+                    await manager.broadcast(room, {
+                        "type": "delete",
+                        "id": data["id"],
+                        "by": username
+                    })
 
             elif data["type"] == "make_admin":
-                room = data["room"]
-                target = data["target"]
-                with lock:
-                    if client_socket in rooms[room]["admins"]:
-                        for s, u in clients.items():
-                            if u["name"] == target:
-                                rooms[room]["admins"].add(s)
-                                send_json(s, {"type": "info", "msg": f"Ara ets administrador de {room}."})
-                                break
+                if manager.creators[room] == username:
+                    manager.add_admin(room, data["target"])
+                    await manager.broadcast(room, {
+                        "type": "info",
+                        "msg": f"{data['target']} ara és admin (designat per {username})"
+                    })
 
-    except:
-        pass
-    finally:
-        with lock:
-            for room in clients.get(client_socket, {}).get("rooms", []):
-                if client_socket in rooms[room]["members"]:
-                    rooms[room]["members"].remove(client_socket)
-        client_socket.close()
-
-print(f"Servidor escoltant a {HOST}:{PORT}")
-while True:
-    client_socket, addr = server.accept()
-    threading.Thread(target=handle_client, args=(client_socket,), daemon=True).start()
+    except WebSocketDisconnect:
+        manager.disconnect(room, websocket)
+        await manager.broadcast(room, {"type": "info", "msg": f"{username} ha sortit."})

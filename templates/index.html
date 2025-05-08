@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="ca">
+<head>
+    <meta charset="UTF-8">
+    <title>WebSocket Chat</title>
+    <link rel="stylesheet" href="/static/styles.css">
+
+</head>
+<body>
+    <h1>💬 WebChat</h1>
+    <div>
+        <label>Nom:</label> <input id="username" />
+        <label>Sala:</label> <input id="room" />
+        <button onclick="join()">Entra</button>
+    </div>
+    
+
+    <div id="chat" style="display:none;">
+        <div id="messages" style="height: 300px; overflow-y: scroll; border: 1px solid #ccc; margin-top: 10px;"></div>
+        <input id="input" placeholder="Missatge" />
+        <button onclick="sendMsg()">Envia</button>
+        <br><br>
+        <input id="react_id" placeholder="ID missatge" />
+        <input id="emoji" placeholder="Emoji (ex: 😂)" />
+        <button onclick="sendReaction()">React</button>
+
+        <br>
+        <button onclick="sendDelete()">🗑️ Esborra</button>
+<button onclick="makeAdmin()">⭐ Fer admin</button>
+
+    </div>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>
